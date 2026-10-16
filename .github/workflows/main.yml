@@ -1,168 +1,202 @@
-# Put this file in a PRIVATE repo of yours at .github/workflows/ra2-recomp-build.yml
+# Put this at .github/workflows/compile-test.yml in YOUR fork of
+# https://github.com/sp00nznet/redalert2-recomp
 #
-# It follows the README of sp00nznet/redalert2-recomp (steps 3-7). Not run by me - first run may need tweaks.
+# Job 1 (host-compile): runs on GitHub's free Windows runner. Compiles the
+#   host/runtime C sources with MSVC x86 against a stub in place of the lifted
+#   code. Catches broken host code. Link errors are expected and ignored.
 #
-# Why a self-hosted runner: the build needs YOUR copy of the game (about 1.9 GB, copyrighted).
-# GitHub's hosted runners don't have it, and it shouldn't be uploaded to GitHub. So:
-#   job "toolchain-check"  -> GitHub-hosted, no game, just proves the toolchain + repo layout work
-#   job "build"            -> runs on YOUR Windows PC (self-hosted runner) where the game is installed
-#
-# One-time setup (see chat message): private repo, self-hosted runner with label "ra2-game",
-# repo variable RA2_GAME_DIR = folder holding game.exe and gamemd.exe.
+# Job 2 (full-build): manual only, on YOUR Windows PC registered as a
+#   self-hosted runner. Runs the real pipeline from the README: catalog, lift,
+#   build. Needs your own copy of the game, so it can't run on GitHub's runners.
 
-name: ra2-recomp-build
+name: Compile test
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
-      game:
-        description: "Which game to build"
-        type: choice
-        options: [yr, ra2, both]
-        default: yr
-      force:
-        description: "Redo steps that already finished (catalog, lift, build)"
+      full_build:
+        description: "Run the full lift + build on a self-hosted runner"
+        type: boolean
+        default: false
+      also_ra2:
+        description: "Also build Red Alert 2 (game.exe), not just Yuri's Revenge"
         type: boolean
         default: false
 
 jobs:
-  toolchain-check:
-    runs-on: windows-2022
+  host-compile:
+    runs-on: windows-latest
+    timeout-minutes: 20
     steps:
-      # The recomp repo expects the toolkit as a sibling folder named "tools".
+      # The CMake file expects pcrecomp checked out as ..\tools next to the repo
+      - uses: actions/checkout@v4
+        with:
+          path: ra2
+
       - uses: actions/checkout@v4
         with:
           repository: sp00nznet/pcrecomp
           path: tools
-      - uses: actions/checkout@v4
+
+      # amd64_x86 = 64-bit compiler targeting x86, same as build.cmd
+      - uses: ilammy/msvc-dev-cmd@v1
         with:
-          repository: sp00nznet/redalert2-recomp
-          path: ra2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Python packages (pefile, capstone, ninja)
-        run: python -m pip install pefile capstone ninja
-      - name: MSVC x86 environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x86
-      - name: Show toolchain
+          arch: amd64_x86
+
+      - name: Make sure Ninja exists
+        shell: pwsh
         run: |
-          where cl
-          cmake --version
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
           ninja --version
-          python --version
-      - name: Check repo layout the build expects
-        run: |
-          foreach ($p in @("tools\tools\pe\pe_analyze.py","tools\tools\cpp\rtti.py","tools\tools\disasm\disasm32.py","ra2\run_lift.py","ra2\build.cmd","ra2\CMakeLists.txt")) {
-            if (-not (Test-Path $p)) { throw "missing $p" } else { "ok  $p" }
-          }
 
-  build:
-    needs: toolchain-check
-    runs-on: [self-hosted, windows, ra2-game]
-    timeout-minutes: 360
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        game: ${{ fromJSON(inputs.game == 'both' && '["yr","ra2"]' || format('["{0}"]', inputs.game)) }}
+      # CMake refuses to configure if src/recomp/gen has no .c files
+      - name: Stub the lifted code
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ra2/src/recomp/gen | Out-Null
+          "int ra2_ci_stub;" | Set-Content ra2/src/recomp/gen/ci_stub.c
+
+      - name: Configure
+        run: cmake -S ra2 -B ra2/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Compile host sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # -k 0 keeps going after the (expected) link failure
+          cmake --build ra2/build -- -k 0 2>&1 | Tee-Object -FilePath build.log
+          $bad = Select-String -Path build.log -Pattern 'error C\d+|fatal error C\d+'
+          if ($bad) {
+            Write-Host "::error::Compile errors found"
+            $bad | ForEach-Object { $_.Line }
+            exit 1
+          }
+          Write-Host "No compiler errors. Link errors are expected (lifted code is stubbed)."
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: host-compile-log
+          path: build.log
+
+  full-build:
+    if: github.event_name == 'workflow_dispatch' && inputs.full_build
+    # Your own PC, registered as a runner. Add a custom label to pin it if needed.
+    runs-on: [self-hosted, windows, x64]
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ra2
     env:
+      # Repo variable (Settings > Secrets and variables > Actions > Variables).
+      # Folder that holds game.exe and gamemd.exe.
       RA2_GAME_DIR: ${{ vars.RA2_GAME_DIR }}
-      PYTHONUTF8: "1"
     steps:
-      # clean:false keeps game\, work\ and build\ between runs so reruns skip the slow steps.
+      # clean: false keeps game\ and work\ between runs, so the 15 minute
+      # function catalog only happens the first time.
+      - uses: actions/checkout@v4
+        with:
+          path: ra2
+          clean: false
+
       - uses: actions/checkout@v4
         with:
           repository: sp00nznet/pcrecomp
           path: tools
           clean: false
-      - uses: actions/checkout@v4
-        with:
-          repository: sp00nznet/redalert2-recomp
-          path: ra2
-          clean: false
 
-      - name: Configure target (${{ matrix.game }})
+      - name: Python packages
         run: |
-          if ("${{ matrix.game }}" -eq "yr") {
-            "EXE=gamemd.exe"        | Add-Content $env:GITHUB_ENV
-            "WORK=work"             | Add-Content $env:GITHUB_ENV
-            "LIFT_ARGS=--all"       | Add-Content $env:GITHUB_ENV
-            "BUILD_EXE=build\ra2.exe" | Add-Content $env:GITHUB_ENV
-          } else {
-            "EXE=game.exe"          | Add-Content $env:GITHUB_ENV
-            "WORK=work\game"        | Add-Content $env:GITHUB_ENV
-            "LIFT_ARGS=--all --target game" | Add-Content $env:GITHUB_ENV
-            "BUILD_DIR=build-game"  | Add-Content $env:GITHUB_ENV
-            "CMAKE_ARGS=-DRA2_TARGET=game" | Add-Content $env:GITHUB_ENV
-            "RA2_TARGET=game"       | Add-Content $env:GITHUB_ENV
-            "BUILD_EXE=build-game\ra2.exe" | Add-Content $env:GITHUB_ENV
-          }
-
-      - name: Check Python and the game folder
-        working-directory: ra2
-        run: |
-          py -3 --version
-          if (-not $env:RA2_GAME_DIR) { throw "Set the repo variable RA2_GAME_DIR (Settings > Secrets and variables > Actions > Variables)" }
-          foreach ($f in @("game.exe","gamemd.exe")) {
-            if (-not (Test-Path (Join-Path $env:RA2_GAME_DIR $f))) { throw "$f not found in $env:RA2_GAME_DIR" }
-          }
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
           py -3 -m pip install --user pefile capstone
 
-      - name: Copy game into game\ (about 1.9 GB, only changed files on reruns)
-        working-directory: ra2
+      - name: Copy game files
         run: |
-          robocopy $env:RA2_GAME_DIR game /E /NFL /NDL /NJH /NJS
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
-          $global:LASTEXITCODE = 0
+          $PSNativeCommandUseErrorActionPreference = $false
+          $src = $env:RA2_GAME_DIR
+          if (-not $src) { $src = "C:\Program Files (x86)\Steam\steamapps\common\Command & Conquer Red Alert II" }
+          if (-not (Test-Path "game\gamemd.exe")) {
+            robocopy $src game /E /NFL /NDL /NJH /NJS
+            if ($LASTEXITCODE -ge 8) { Write-Host "::error::robocopy failed"; exit 1 }
+          }
+          exit 0
 
-      - name: Force rebuild - clear previous outputs
-        if: ${{ inputs.force }}
-        working-directory: ra2
+      # ---- Yuri's Revenge (gamemd.exe -> build\ra2.exe)
+      - name: YR - analyze + RTTI
         run: |
-          foreach ($d in @($env:WORK, "build", "build-game")) { if (Test-Path $d) { Remove-Item $d -Recurse -Force } }
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force work | Out-Null
+          py -3 ..\tools\tools\pe\pe_analyze.py game\gamemd.exe --json work\pe_analysis.json
+          py -3 ..\tools\tools\cpp\rtti.py game\gamemd.exe -o work\rtti.json --seeds work\rtti_seeds.json
 
-      - name: Analyze binary (PE + RTTI, seconds)
-        working-directory: ra2
+      - name: YR - function catalog (about 15 min, skipped if cached)
         run: |
-          New-Item -ItemType Directory -Force $env:WORK | Out-Null
-          py -3 ..\tools\tools\pe\pe_analyze.py game\$env:EXE --json $env:WORK\pe_analysis.json
-          if ($LASTEXITCODE -ne 0) { throw "pe_analyze failed" }
-          py -3 ..\tools\tools\cpp\rtti.py game\$env:EXE -o $env:WORK\rtti.json --seeds $env:WORK\rtti_seeds.json
-          if ($LASTEXITCODE -ne 0) { throw "rtti failed (yr should report 954 classes)" }
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
+          if (-not (Test-Path work\functions.json)) {
+            py -3 ..\tools\tools\disasm\disasm32.py game\gamemd.exe -o work\functions.json --seed-functions work\rtti_seeds.json
+          }
 
-      - name: Function catalog (about 15 minutes; yr expects 24940, ra2 expects 23191)
-        working-directory: ra2
+      - name: YR - lift
         run: |
-          if ((Test-Path "$env:WORK\functions.json") -and ("${{ inputs.force }}" -ne "true")) { "catalog exists - skipping"; exit 0 }
-          py -3 ..\tools\tools\disasm\disasm32.py game\$env:EXE -o $env:WORK\functions.json --seed-functions $env:WORK\rtti_seeds.json
-          if ($LASTEXITCODE -ne 0) { throw "disasm32 failed" }
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
+          py -3 run_lift.py --all
 
-      - name: Lift to C (5-15 minutes; must end with "errors 0")
-        working-directory: ra2
+      - name: YR - build
         run: |
-          $liftArgs = $env:LIFT_ARGS -split ' '
-          py -3 run_lift.py @liftArgs
-          if ($LASTEXITCODE -ne 0) { throw "lift failed" }
+          $ErrorActionPreference = 'Continue'
+          cmd /c build.cmd 2>&1 | Tee-Object -FilePath build-yr.log
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::YR build failed"; exit $LASTEXITCODE }
+          if (-not (Test-Path build\ra2.exe)) { Write-Host "::error::build\ra2.exe missing"; exit 1 }
 
-      - name: Build (MSVC x86 via build.cmd)
-        working-directory: ra2
-        run: |
-          cmd /c build.cmd
-          if ($LASTEXITCODE -ne 0) { throw "build failed" }
-          if (-not (Test-Path $env:BUILD_EXE)) { throw "$env:BUILD_EXE was not produced" }
-          Get-Item $env:BUILD_EXE | Format-List Name, Length, LastWriteTime
-
-      # Needs a real desktop session. If the runner runs as a Windows service this can fail even
-      # when the build is fine; start the runner with run.cmd while logged in, or ignore this step.
-      - name: Conformance (boot to main menu, headless, muted)
+      - name: YR - conformance (boot milestones, optional)
         continue-on-error: true
-        working-directory: ra2
         run: |
-          py -3 tools\conformance.py
-          if ($LASTEXITCODE -ne 0) { throw "conformance reported a regression" }
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
+          py -3 tools\conformance.py 2>&1 | Tee-Object -FilePath conformance-yr.log
 
-      # Deliberately NOT uploading ra2.exe or the lifted C as artifacts: both are generated from
-      # EA's game and are not meant to be distributed. They stay on your PC in the runner workspace.
+      # ---- Red Alert 2 (game.exe -> build-game\ra2.exe)
+      - name: RA2 - analyze, RTTI, catalog
+        if: inputs.also_ra2
+        run: |
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force work\game | Out-Null
+          py -3 ..\tools\tools\pe\pe_analyze.py game\game.exe --json work\game\pe_analysis.json
+          py -3 ..\tools\tools\cpp\rtti.py game\game.exe -o work\game\rtti.json --seeds work\game\rtti_seeds.json
+          if (-not (Test-Path work\game\functions.json)) {
+            py -3 ..\tools\tools\disasm\disasm32.py game\game.exe -o work\game\functions.json --seed-functions work\game\rtti_seeds.json
+          }
+
+      - name: RA2 - lift
+        if: inputs.also_ra2
+        run: |
+          $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true
+          py -3 run_lift.py --all --target game
+
+      - name: RA2 - build
+        if: inputs.also_ra2
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:BUILD_DIR = 'build-game'
+          $env:CMAKE_ARGS = '-DRA2_TARGET=game'
+          cmd /c build.cmd 2>&1 | Tee-Object -FilePath build-ra2.log
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::RA2 build failed"; exit $LASTEXITCODE }
+          if (-not (Test-Path build-game\ra2.exe)) { Write-Host "::error::build-game\ra2.exe missing"; exit 1 }
+
+      # Logs only. Never upload ra2.exe or the lifted C: they are derived from
+      # EA's game and the repo's license says they must not be distributed.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-build-logs
+          path: |
+            ra2/build-yr.log
+            ra2/build-ra2.log
+            ra2/conformance-yr.log
+          if-no-files-found: ignore
