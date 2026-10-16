@@ -39,8 +39,10 @@ jobs:
         include:
           - target: gamemd          # Yuri's Revenge
             cmake_args: ""
+            out_name: RA2YR.exe
           - target: game            # Red Alert 2
             cmake_args: "-DRA2_TARGET=game"
+            out_name: RA2.exe
     steps:
       # The CMake file expects pcrecomp checked out as ..\tools next to the repo
       - uses: actions/checkout@v4
@@ -122,11 +124,16 @@ jobs:
         shell: pwsh
         run: ./ra2/build/ra2.exe --help
 
-      - name: Upload skeleton ra2.exe (host code only, no game code)
+      # Both games build a file called ra2.exe; rename the copy so you can tell them apart
+      - name: Rename for upload
+        shell: pwsh
+        run: Copy-Item ra2/build/ra2.exe "ra2/build/${{ matrix.out_name }}"
+
+      - name: Upload skeleton exe (host code only, no game code)
         uses: actions/upload-artifact@v4
         with:
-          name: ra2-host-skeleton-${{ matrix.target }}
-          path: ra2/build/ra2.exe
+          name: ${{ matrix.out_name }}
+          path: ra2/build/${{ matrix.out_name }}
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
