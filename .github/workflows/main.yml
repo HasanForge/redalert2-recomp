@@ -42,7 +42,7 @@ jobs:
             out_name: RA2YR.exe
           - target: game            # Red Alert 2
             cmake_args: "-DRA2_TARGET=game"
-            out_name: RA2.exe
+            out_name: RA2-RedAlert2.exe
     steps:
       # The CMake file expects pcrecomp checked out as ..\tools next to the repo
       - uses: actions/checkout@v4
@@ -124,16 +124,20 @@ jobs:
         shell: pwsh
         run: ./ra2/build/ra2.exe --help
 
-      # Both games build a file called ra2.exe; rename the copy so you can tell them apart
+      # Both games build a file called ra2.exe; rename the copy so you can tell them apart.
+      # Copy into another folder: Windows file names ignore case, so RA2.exe and
+      # ra2.exe in the same folder are the same file.
       - name: Rename for upload
         shell: pwsh
-        run: Copy-Item ra2/build/ra2.exe "ra2/build/${{ matrix.out_name }}"
+        run: |
+          New-Item -ItemType Directory -Force ra2/out | Out-Null
+          Copy-Item ra2/build/ra2.exe "ra2/out/${{ matrix.out_name }}"
 
       - name: Upload skeleton exe (host code only, no game code)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out_name }}
-          path: ra2/build/${{ matrix.out_name }}
+          path: ra2/out/${{ matrix.out_name }}
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
@@ -257,3 +261,4 @@ jobs:
             ra2/build-ra2.log
             ra2/conformance-yr.log
           if-no-files-found: ignore
+          
